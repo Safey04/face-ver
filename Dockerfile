@@ -17,7 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # so first request doesn't have a cold-start delay
 RUN python -c "from insightface.app import FaceAnalysis; \
     app = FaceAnalysis(name='buffalo_l', allowed_modules=['detection','recognition'], \
-    providers=['CPUExecutionProvider']); app.prepare(ctx_id=0, det_size=(640,640)); \
+    providers=['CPUExecutionProvider']); app.prepare(ctx_id=0, det_size=(320,320)); \
     print('Model pre-downloaded successfully')"
 
 COPY main.py .
