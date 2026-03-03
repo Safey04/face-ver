@@ -110,8 +110,8 @@ def _get_embedding(img: np.ndarray) -> Optional[np.ndarray]:
     return best.normed_embedding
 
 
-async def _call_roboflow(image_bytes: bytes) -> list[bytes]:
-    """Send image to Roboflow Workflow and return list of cropped face images as bytes."""
+async def _call_roboflow(image_bytes: bytes) -> list[dict]:
+    """Send image to Roboflow Workflow and return list of face bounding boxes."""
     url = (
         f"https://detect.roboflow.com/{ROBOFLOW_WORKSPACE}/{ROBOFLOW_WORKFLOW_ID}"
     )
@@ -135,24 +135,26 @@ async def _call_roboflow(image_bytes: bytes) -> list[bytes]:
         )
 
     data = resp.json()
-    outputs = data.get("outputs", [{}])
-    if not outputs:
+    # Response: [{"predictions": {"predictions": [...]}}]
+    if not data:
         return []
 
-    # Extract cropped images — adjust the key based on your workflow's output name
-    crops = []
-    for output in outputs:
-        for key, value in output.items():
-            if isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict) and "value" in item:
-                        crops.append(base64.b64decode(item["value"]))
-                    elif isinstance(item, dict) and "image" in item:
-                        crops.append(base64.b64decode(item["image"]))
-            elif isinstance(value, dict) and "value" in value:
-                crops.append(base64.b64decode(value["value"]))
+    predictions = data[0].get("predictions", {}).get("predictions", [])
+    return predictions
 
-    return crops
+
+def _crop_face(img: np.ndarray, det: dict) -> np.ndarray:
+    """Crop a face from the image using Roboflow's center-x/y/w/h bbox."""
+    h, w = img.shape[:2]
+    cx, cy = det["x"], det["y"]
+    bw, bh = det["width"], det["height"]
+
+    x1 = max(0, int(cx - bw / 2))
+    y1 = max(0, int(cy - bh / 2))
+    x2 = min(w, int(cx + bw / 2))
+    y2 = min(h, int(cy + bh / 2))
+
+    return img[y1:y2, x1:x2]
 
 
 # ---------------------------------------------------------------------------
@@ -191,29 +193,30 @@ async def embed(
     """
     image_bytes = await image.read()
 
-    # Step 1: Send to Roboflow for cropping
+    # Step 1: Decode the uploaded image
     try:
-        cropped_faces = await _call_roboflow(image_bytes)
+        img = _decode_image(image_bytes)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Image decode error: {exc}")
+
+    # Step 2: Send to Roboflow for face detection
+    try:
+        detections = await _call_roboflow(image_bytes)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Roboflow call failed: {exc}")
 
-    if not cropped_faces:
+    if not detections:
         raise HTTPException(status_code=422, detail="No faces detected by Roboflow")
 
-    # Step 2: Get embeddings for each cropped face
+    # Step 3: Crop each face and compute embeddings
     results = []
-    for i, crop_bytes in enumerate(cropped_faces):
-        try:
-            img = _decode_image(crop_bytes)
-        except ValueError:
-            logger.warning("Could not decode cropped face %d, skipping", i)
-            continue
-
-        emb = _get_embedding(img)
+    for i, det in enumerate(detections):
+        crop = _crop_face(img, det)
+        emb = _get_embedding(crop)
         if emb is None:
-            logger.warning("No embedding for cropped face %d, skipping", i)
+            logger.warning("No embedding for face %d, skipping", i)
             continue
 
         results.append(FaceEmbedding(embedding=emb.tolist(), dimension=len(emb)))
