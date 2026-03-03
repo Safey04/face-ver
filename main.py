@@ -39,9 +39,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-ROBOFLOW_API_KEY = os.environ.get("ROBOFLOW_API_KEY", "")
-ROBOFLOW_WORKSPACE = os.environ.get("ROBOFLOW_WORKSPACE", "")
-ROBOFLOW_WORKFLOW_ID = os.environ.get("ROBOFLOW_WORKFLOW_ID", "")
+ROBOFLOW_API_KEY = os.environ.get("ROBOFLOW_API_KEY", "TqKdLCjMBWTHVC8CNhN7")
+ROBOFLOW_WORKSPACE = os.environ.get("ROBOFLOW_WORKSPACE", "validationmodel")
+ROBOFLOW_WORKFLOW_ID = os.environ.get("ROBOFLOW_WORKFLOW_ID", "custom-workflow-6")
 
 # ---------------------------------------------------------------------------
 # Global model reference (loaded once at startup)
@@ -103,11 +103,27 @@ def _decode_image(data: bytes) -> np.ndarray:
 
 
 def _get_embedding(img: np.ndarray) -> Optional[np.ndarray]:
+    """Get embedding, first trying detection, then falling back to direct recognition."""
+    # Try normal detection + recognition
     faces = face_app.get(img)
-    if not faces:
-        return None
-    best = max(faces, key=lambda f: f.det_score)
-    return best.normed_embedding
+    if faces:
+        best = max(faces, key=lambda f: f.det_score)
+        return best.normed_embedding
+
+    # Face already cropped by Roboflow — detector can't find it again.
+    # Resize to 112x112 and run recognition model directly.
+    resized = cv2.resize(img, (112, 112))
+    blob = np.transpose(resized, (2, 0, 1)).astype(np.float32)
+    blob = (blob - 127.5) / 127.5
+    blob = np.expand_dims(blob, axis=0)
+
+    rec_model = face_app.models["recognition"]
+    embedding = rec_model.session.run(None, {rec_model.session.get_inputs()[0].name: blob})[0][0]
+    # Normalize
+    norm = np.linalg.norm(embedding)
+    if norm > 0:
+        embedding = embedding / norm
+    return embedding
 
 
 async def _call_roboflow(image_bytes: bytes) -> list[dict]:
@@ -135,11 +151,11 @@ async def _call_roboflow(image_bytes: bytes) -> list[dict]:
         )
 
     data = resp.json()
-    # Response: [{"predictions": {"predictions": [...]}}]
-    if not data:
+    outputs = data.get("outputs", [])
+    if not outputs:
         return []
 
-    predictions = data[0].get("predictions", {}).get("predictions", [])
+    predictions = outputs[0].get("predictions", {}).get("predictions", [])
     return predictions
 
 
