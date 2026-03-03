@@ -1,24 +1,29 @@
 """
-ArcFace Face Verification API
-------------------------------
-Lightweight FastAPI microservice that receives two face images
-and returns a cosine-similarity score + match decision.
-
-Designed to pair with a Roboflow Workflow that handles
-face detection and cropping upstream.
+ArcFace Face Embedding API
+---------------------------
+Receives a face image, sends it to a Roboflow Workflow for
+face detection + cropping, then returns 512-d ArcFace embeddings
+for each detected face.
 
 Usage:
     uvicorn main:app --host 0.0.0.0 --port 8000
+
+Environment variables:
+    ROBOFLOW_API_KEY      - Your Roboflow API key
+    ROBOFLOW_WORKSPACE    - Your Roboflow workspace name
+    ROBOFLOW_WORKFLOW_ID  - Your Roboflow workflow ID
 """
 
+import base64
 import logging
-import time
+import os
 from contextlib import asynccontextmanager
 from typing import Optional
 
 import cv2
+import httpx
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -32,20 +37,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+ROBOFLOW_API_KEY = os.environ.get("ROBOFLOW_API_KEY", "")
+ROBOFLOW_WORKSPACE = os.environ.get("ROBOFLOW_WORKSPACE", "")
+ROBOFLOW_WORKFLOW_ID = os.environ.get("ROBOFLOW_WORKFLOW_ID", "")
+
+# ---------------------------------------------------------------------------
 # Global model reference (loaded once at startup)
 # ---------------------------------------------------------------------------
 face_app = None
 
 
 def _load_model():
-    """Load InsightFace model. Called once during app lifespan."""
     from insightface.app import FaceAnalysis
 
     logger.info("Loading InsightFace buffalo_l model ...")
     app = FaceAnalysis(
         name="buffalo_l",
-        # Only load detection + recognition -- skip landmarks & gender/age
-        # This saves memory and speeds up inference
         allowed_modules=["detection", "recognition"],
         providers=["CPUExecutionProvider"],
     )
@@ -56,9 +65,10 @@ def _load_model():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup / shutdown hook -- load model once into memory."""
     global face_app
     face_app = _load_model()
+    if not ROBOFLOW_API_KEY:
+        logger.warning("ROBOFLOW_API_KEY is not set!")
     yield
     logger.info("Shutting down ...")
 
@@ -67,12 +77,9 @@ async def lifespan(app: FastAPI):
 # FastAPI app
 # ---------------------------------------------------------------------------
 app = FastAPI(
-    title="ArcFace Face Verification API",
+    title="ArcFace Face Embedding API",
     version="1.0.0",
-    description=(
-        "Receives two face images and returns a cosine-similarity score. "
-        "Designed to work with Roboflow Workflows for face detection + cropping."
-    ),
+    description="Sends image to Roboflow for face cropping, returns ArcFace embeddings.",
     lifespan=lifespan,
 )
 
@@ -87,9 +94,8 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _read_image(file_bytes: bytes) -> np.ndarray:
-    """Decode uploaded bytes into a BGR numpy array."""
-    arr = np.frombuffer(file_bytes, np.uint8)
+def _decode_image(data: bytes) -> np.ndarray:
+    arr = np.frombuffer(data, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
         raise ValueError("Could not decode image")
@@ -97,38 +103,69 @@ def _read_image(file_bytes: bytes) -> np.ndarray:
 
 
 def _get_embedding(img: np.ndarray) -> Optional[np.ndarray]:
-    """
-    Run InsightFace detection + recognition on an image.
-    Returns the 512-d normalized embedding of the best-detected face,
-    or None if no face is found.
-    """
     faces = face_app.get(img)
     if not faces:
         return None
-    # Pick the face with the highest detection confidence
     best = max(faces, key=lambda f: f.det_score)
     return best.normed_embedding
 
 
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Compute cosine similarity between two vectors."""
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+async def _call_roboflow(image_bytes: bytes) -> list[bytes]:
+    """Send image to Roboflow Workflow and return list of cropped face images as bytes."""
+    url = (
+        f"https://detect.roboflow.com/{ROBOFLOW_WORKSPACE}/{ROBOFLOW_WORKFLOW_ID}"
+    )
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    payload = {
+        "api_key": ROBOFLOW_API_KEY,
+        "inputs": {
+            "image": {"type": "base64", "value": image_b64},
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(url, json=payload)
+
+    if resp.status_code != 200:
+        logger.error("Roboflow error %s: %s", resp.status_code, resp.text)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Roboflow returned {resp.status_code}: {resp.text}",
+        )
+
+    data = resp.json()
+    outputs = data.get("outputs", [{}])
+    if not outputs:
+        return []
+
+    # Extract cropped images — adjust the key based on your workflow's output name
+    crops = []
+    for output in outputs:
+        for key, value in output.items():
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict) and "value" in item:
+                        crops.append(base64.b64decode(item["value"]))
+                    elif isinstance(item, dict) and "image" in item:
+                        crops.append(base64.b64decode(item["image"]))
+            elif isinstance(value, dict) and "value" in value:
+                crops.append(base64.b64decode(value["value"]))
+
+    return crops
 
 
 # ---------------------------------------------------------------------------
 # Response models
 # ---------------------------------------------------------------------------
-class VerifyResponse(BaseModel):
-    similarity: float
-    match: bool
-    threshold: float
-    time_ms: float
-    error: Optional[str] = None
+class FaceEmbedding(BaseModel):
+    embedding: list[float]
+    dimension: int
 
 
 class EmbedResponse(BaseModel):
-    embedding: list
-    dimension: int
+    faces: list[FaceEmbedding]
+    face_count: int
 
 
 class HealthResponse(BaseModel):
@@ -141,80 +178,44 @@ class HealthResponse(BaseModel):
 # ---------------------------------------------------------------------------
 @app.get("/health", response_model=HealthResponse)
 async def health():
-    """Health check endpoint."""
     return HealthResponse(status="ok", model_loaded=face_app is not None)
-
-
-@app.post("/verify", response_model=VerifyResponse)
-async def verify(
-    image_1: UploadFile = File(..., description="Reference face image"),
-    image_2: UploadFile = File(..., description="Probe face image"),
-    threshold: float = Form(0.45, description="Cosine-similarity threshold"),
-):
-    """
-    Compare two face images and return a similarity score.
-
-    - **image_1**: Reference / enrolled face (JPEG or PNG).
-    - **image_2**: Probe / query face (JPEG or PNG).
-    - **threshold**: Score >= threshold --> MATCH (default 0.45).
-    """
-    t0 = time.perf_counter()
-
-    # --- Read images ---
-    try:
-        bytes_1 = await image_1.read()
-        bytes_2 = await image_2.read()
-        img1 = _read_image(bytes_1)
-        img2 = _read_image(bytes_2)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Image decode error: {exc}")
-
-    # --- Extract embeddings ---
-    emb1 = _get_embedding(img1)
-    emb2 = _get_embedding(img2)
-
-    elapsed = (time.perf_counter() - t0) * 1000
-
-    if emb1 is None or emb2 is None:
-        missing = []
-        if emb1 is None:
-            missing.append("image_1")
-        if emb2 is None:
-            missing.append("image_2")
-        return VerifyResponse(
-            similarity=0.0,
-            match=False,
-            threshold=threshold,
-            time_ms=round(elapsed, 1),
-            error=f"No face detected in: {', '.join(missing)}",
-        )
-
-    # --- Compare ---
-    sim = cosine_similarity(emb1, emb2)
-
-    return VerifyResponse(
-        similarity=round(sim, 4),
-        match=sim >= threshold,
-        threshold=threshold,
-        time_ms=round(elapsed, 1),
-    )
 
 
 @app.post("/embed", response_model=EmbedResponse)
 async def embed(
-    image: UploadFile = File(..., description="Face image to embed"),
+    image: UploadFile = File(..., description="Image containing faces"),
 ):
     """
-    Return the 512-d ArcFace embedding for a single face image.
-    Useful for pre-computing and storing reference embeddings.
+    Send an image to Roboflow for face detection/cropping,
+    then return ArcFace embeddings for each detected face.
     """
+    image_bytes = await image.read()
+
+    # Step 1: Send to Roboflow for cropping
     try:
-        img = _read_image(await image.read())
+        cropped_faces = await _call_roboflow(image_bytes)
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Image decode error: {exc}")
+        raise HTTPException(status_code=502, detail=f"Roboflow call failed: {exc}")
 
-    emb = _get_embedding(img)
-    if emb is None:
-        raise HTTPException(status_code=422, detail="No face detected in image")
+    if not cropped_faces:
+        raise HTTPException(status_code=422, detail="No faces detected by Roboflow")
 
-    return EmbedResponse(embedding=emb.tolist(), dimension=len(emb))
+    # Step 2: Get embeddings for each cropped face
+    results = []
+    for i, crop_bytes in enumerate(cropped_faces):
+        try:
+            img = _decode_image(crop_bytes)
+        except ValueError:
+            logger.warning("Could not decode cropped face %d, skipping", i)
+            continue
+
+        emb = _get_embedding(img)
+        if emb is None:
+            logger.warning("No embedding for cropped face %d, skipping", i)
+            continue
+
+        results.append(FaceEmbedding(embedding=emb.tolist(), dimension=len(emb)))
+
+    return EmbedResponse(faces=results, face_count=len(results))
