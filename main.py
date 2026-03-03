@@ -113,7 +113,7 @@ def _get_embedding(img: np.ndarray) -> Optional[np.ndarray]:
 async def _call_roboflow(image_bytes: bytes) -> list[dict]:
     """Send image to Roboflow Workflow and return list of face bounding boxes."""
     url = (
-        f"https://detect.roboflow.com/{ROBOFLOW_WORKSPACE}/{ROBOFLOW_WORKFLOW_ID}"
+        f"https://serverless.roboflow.com/{ROBOFLOW_WORKSPACE}/workflows/{ROBOFLOW_WORKFLOW_ID}"
     )
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
